@@ -16,6 +16,7 @@ BATCH_DIR="$SCRIPT_DIR"
 INPUT_FILE="$BATCH_DIR/batch-input.tsv"
 STATE_FILE="$BATCH_DIR/batch-state.tsv"
 PROMPT_FILE="$BATCH_DIR/batch-prompt.md"
+TRIAGE_PROMPT_FILE="$BATCH_DIR/batch-triage-prompt.md"
 LOGS_DIR="$BATCH_DIR/logs"
 TRACKER_DIR="$BATCH_DIR/tracker-additions"
 REPORTS_DIR="$PROJECT_DIR/reports"
@@ -34,6 +35,10 @@ START_FROM=0
 MAX_RETRIES=2
 MIN_SCORE=0
 MODEL=""  # empty = let claude -p use the Claude Max default
+RUN_TRIAGE=false
+RUN_FULL=false
+RUN_ALL=false
+TRIAGE_THRESHOLD=3.0
 
 usage() {
   cat <<'USAGE'
@@ -41,6 +46,13 @@ career-ops batch runner — process job offers in batch via claude -p workers
 Uses your default Claude model (Claude Max subscription).
 
 Usage: batch-runner.sh [OPTIONS]
+
+Pass control:
+  --triage              Run Pass 1 only — score all pending via Haiku (fast, cheap)
+  --triage-threshold N  Min triage score to pass (default: 3.0; scores >= N pass)
+  --full                Run Pass 2 only — full eval on triage_pass entries
+  --all                 Bypass triage, full eval on all pending (backward compat)
+  (default)             Same as --full; falls back to all pending if no triage done
 
 Options:
   --parallel N         Number of parallel workers (default: 1)
@@ -55,30 +67,36 @@ Options:
   -h, --help           Show this help
 
 Files:
-  batch-input.tsv      Input offers (id, url, source, notes)
-  batch-state.tsv      Processing state (auto-managed)
-  batch-prompt.md      Prompt template for workers
-  logs/                Per-offer logs
-  tracker-additions/   Tracker lines for post-batch merge
+  batch-input.tsv        Input offers (id, url, source, notes)
+  batch-state.tsv        Processing state (auto-managed)
+  batch-prompt.md        Full eval prompt template (Pass 2)
+  batch-triage-prompt.md Triage prompt template (Pass 1, Haiku)
+  logs/                  Per-offer logs
+  tracker-additions/     Tracker lines for post-batch merge
 
 Examples:
-  # Dry run to see pending offers
-  ./batch-runner.sh --dry-run
+  # Two-pass workflow (recommended):
+  ./batch-runner.sh --triage --parallel 5
+  ./batch-runner.sh --full --parallel 3
 
-  # Process all pending
-  ./batch-runner.sh
+  # Dry run to see what would be triaged
+  ./batch-runner.sh --triage --dry-run
+
+  # Backward compat: skip triage, eval everything
+  ./batch-runner.sh --all --parallel 3
 
   # Retry only failed offers
   ./batch-runner.sh --retry-failed
-
-  # Process 2 at a time starting from ID 10
-  ./batch-runner.sh --parallel 2 --start-from 10
 USAGE
 }
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --triage) RUN_TRIAGE=true; shift ;;
+    --triage-threshold) TRIAGE_THRESHOLD="$2"; shift 2 ;;
+    --full) RUN_FULL=true; shift ;;
+    --all) RUN_ALL=true; shift ;;
     --parallel) PARALLEL="$2"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
     --retry-failed) RETRY_FAILED=true; shift ;;
@@ -124,7 +142,12 @@ check_prerequisites() {
     exit 1
   fi
 
-  if [[ ! -f "$PROMPT_FILE" ]]; then
+  if [[ "$RUN_TRIAGE" == "true" && ! -f "$TRIAGE_PROMPT_FILE" ]]; then
+    echo "ERROR: $TRIAGE_PROMPT_FILE not found."
+    exit 1
+  fi
+
+  if [[ "$RUN_TRIAGE" != "true" && ! -f "$PROMPT_FILE" ]]; then
     echo "ERROR: $PROMPT_FILE not found."
     exit 1
   fi
@@ -314,6 +337,76 @@ reserve_report_num() {
   run_with_state_lock reserve_report_num_unlocked "$@"
 }
 
+# Triage a single offer (Pass 1 — Haiku, fast, no report/PDF/tracker)
+process_triage() {
+  local id="$1" url="$2"
+
+  local started_at
+  started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  local retries
+  retries=$(get_retries "$id")
+  local jd_file="/tmp/batch-jd-${id}.txt"
+
+  echo "--- Triaging offer #$id: $url (attempt $((retries + 1)))"
+
+  local resolved_prompt="$BATCH_DIR/.resolved-triage-${id}.md"
+  local esc_url esc_jd_file esc_id
+  esc_url="${url//\\/\\\\}"
+  esc_url="${esc_url//|/\\|}"
+  esc_jd_file="${jd_file//\\/\\\\}"
+  esc_jd_file="${esc_jd_file//|/\\|}"
+  esc_id="${id//|/\\|}"
+  sed \
+    -e "s|{{URL}}|${esc_url}|g" \
+    -e "s|{{JD_FILE}}|${esc_jd_file}|g" \
+    -e "s|{{ID}}|${esc_id}|g" \
+    "$TRIAGE_PROMPT_FILE" > "$resolved_prompt"
+
+  local log_file="$LOGS_DIR/triage-${id}.log"
+  local prompt="Triage this job offer. URL: $url. Output only a JSON object."
+
+  local exit_code=0
+  claude -p \
+    --model claude-haiku-4-5-20251001 \
+    --dangerously-skip-permissions \
+    --append-system-prompt-file "$resolved_prompt" \
+    "$prompt" \
+    > "$log_file" 2>&1 || exit_code=$?
+
+  rm -f "$resolved_prompt"
+
+  local completed_at
+  completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  if [[ $exit_code -eq 0 ]]; then
+    local triage_score="-"
+    local score_match
+    score_match=$(grep -o '"triage_score":[[:space:]]*[0-9.]*' "$log_file" 2>/dev/null | grep -o '[0-9.]*$' | head -1 || true)
+    if [[ -n "$score_match" ]]; then
+      triage_score="$score_match"
+    fi
+
+    local status="triage_fail"
+    if [[ "$triage_score" != "-" ]] && (( $(echo "$triage_score >= $TRIAGE_THRESHOLD" | bc -l) )); then
+      status="triage_pass"
+    fi
+
+    local triage_reason title_only_flag
+    triage_reason=$(grep -o '"triage_reason":[[:space:]]*"[^"]*"' "$log_file" 2>/dev/null | sed 's/"triage_reason":[[:space:]]*"//' | sed 's/"$//' | head -1 || true)
+    title_only_flag=$(grep -o '"title_only":[[:space:]]*[a-z]*' "$log_file" 2>/dev/null | grep -o '[a-z]*$' | head -1 || true)
+
+    update_state "$id" "$url" "$status" "$started_at" "$completed_at" "-" "$triage_score" "-" "$retries"
+    echo "    $([ "$status" = "triage_pass" ] && echo "✅" || echo "❌") Triage $status (score: $triage_score$([ "$title_only_flag" = "true" ] && echo ", title-only" || echo ""))"
+    [[ -n "$triage_reason" ]] && echo "    → $triage_reason"
+  else
+    retries=$((retries + 1))
+    local error_msg
+    error_msg=$(tail -5 "$log_file" 2>/dev/null | tr '\n' ' ' | cut -c1-200 || echo "Unknown error (exit code $exit_code)")
+    update_state "$id" "$url" "failed" "$started_at" "$completed_at" "-" "-" "$error_msg" "$retries"
+    echo "    ❌ Triage failed (attempt $retries, exit code $exit_code)"
+  fi
+}
+
 # Process a single offer
 process_offer() {
   local id="$1" url="$2" source="$3" notes="$4"
@@ -392,7 +485,7 @@ process_offer() {
       if (( $(echo "$score < $MIN_SCORE" | bc -l) )); then
         update_state "$id" "$url" "skipped" "$started_at" "$completed_at" "$report_num" "$score" "below-min-score" "$retries"
         echo "    ⏭️  Skipped (score: $score < min-score: $MIN_SCORE)"
-        continue
+        return
       fi
     fi
 
@@ -474,8 +567,19 @@ main() {
     exit 0
   fi
 
+  # Determine pass mode
+  # --triage: Pass 1 only. --full or default: Pass 2 (triage_pass entries).
+  # --all: Pass 2 on all pending (backward compat).
+  local MODE="full"
+  if [[ "$RUN_TRIAGE" == "true" ]]; then
+    MODE="triage"
+  elif [[ "$RUN_ALL" == "true" ]]; then
+    MODE="all"
+  fi
+
   echo "=== career-ops batch runner ==="
-  echo "Parallel: $PARALLEL | Max retries: $MAX_RETRIES"
+  echo "Mode: $MODE | Parallel: $PARALLEL | Max retries: $MAX_RETRIES"
+  [[ "$MODE" == "triage" ]] && echo "Triage threshold: >= $TRIAGE_THRESHOLD"
   echo "Input: $total_input offers"
   echo ""
 
@@ -485,14 +589,19 @@ main() {
   local -a pending_sources=()
   local -a pending_notes=()
 
-  while IFS=$'\t' read -r id url source notes; do
-    [[ "$id" == "id" ]] && continue  # skip header
-    [[ -z "$id" || -z "$url" ]] && continue
+  # Detect whether any triage has been run (for smart default fallback)
+  local any_triage_done=false
+  if [[ -f "$STATE_FILE" ]]; then
+    if grep -qE '	triage_pass|	triage_fail' "$STATE_FILE" 2>/dev/null; then
+      any_triage_done=true
+    fi
+  fi
 
-    # Guard against non-numeric id values
+  while IFS=$'\t' read -r id url source notes; do
+    [[ "$id" == "id" ]] && continue
+    [[ -z "$id" || -z "$url" ]] && continue
     [[ "$id" =~ ^[0-9]+$ ]] || continue
 
-    # Skip if before start-from
     if (( id < START_FROM )); then
       continue
     fi
@@ -501,11 +610,9 @@ main() {
     status=$(get_status "$id")
 
     if [[ "$RETRY_FAILED" == "true" ]]; then
-      # Only process failed offers
       if [[ "$status" != "failed" ]]; then
         continue
       fi
-      # Check retry limit
       local retries
       retries=$(get_retries "$id")
       if (( retries >= MAX_RETRIES )); then
@@ -513,19 +620,61 @@ main() {
         continue
       fi
     else
-      # Skip completed offers
-      if [[ "$status" == "completed" ]]; then
-        continue
-      fi
-      # Skip failed offers that hit retry limit (unless --retry-failed)
-      if [[ "$status" == "failed" ]]; then
-        local retries
-        retries=$(get_retries "$id")
-        if (( retries >= MAX_RETRIES )); then
-          echo "SKIP #$id: failed and max retries reached (use --retry-failed to force)"
-          continue
-        fi
-      fi
+      case "$MODE" in
+        triage)
+          # Pass 1: process entries that are pending/none/failed (not already triaged or completed)
+          if [[ "$status" == "completed" || "$status" == "triage_pass" || "$status" == "triage_fail" ]]; then
+            continue
+          fi
+          if [[ "$status" == "failed" ]]; then
+            local retries
+            retries=$(get_retries "$id")
+            if (( retries >= MAX_RETRIES )); then
+              echo "SKIP #$id: failed and max retries reached"
+              continue
+            fi
+          fi
+          ;;
+        full)
+          # Pass 2: process triage_pass entries only.
+          # If no triage has been run yet, fall back to pending/none (backward compat).
+          if [[ "$any_triage_done" == "true" ]]; then
+            if [[ "$status" != "triage_pass" ]]; then
+              continue
+            fi
+          else
+            if [[ "$status" == "completed" || "$status" == "triage_fail" ]]; then
+              continue
+            fi
+            if [[ "$status" == "failed" ]]; then
+              local retries
+              retries=$(get_retries "$id")
+              if (( retries >= MAX_RETRIES )); then
+                echo "SKIP #$id: failed and max retries reached"
+                continue
+              fi
+            fi
+          fi
+          ;;
+        all)
+          # Bypass triage: process all pending/none (original behaviour)
+          if [[ "$status" == "completed" ]]; then
+            continue
+          fi
+          if [[ "$status" == "failed" ]]; then
+            local retries
+            retries=$(get_retries "$id")
+            if (( retries >= MAX_RETRIES )); then
+              echo "SKIP #$id: failed and max retries reached (use --retry-failed to force)"
+              continue
+            fi
+          fi
+          # Skip triage results in --all mode (re-eval only truly unprocessed)
+          if [[ "$status" == "triage_fail" ]]; then
+            continue
+          fi
+          ;;
+      esac
     fi
 
     pending_ids+=("$id")
@@ -558,54 +707,77 @@ main() {
     exit 0
   fi
 
-  # Process offers
-  if (( PARALLEL <= 1 )); then
-    # Sequential processing
-    for i in "${!pending_ids[@]}"; do
-      process_offer "${pending_ids[$i]}" "${pending_urls[$i]}" "${pending_sources[$i]}" "${pending_notes[$i]}"
-    done
-  else
-    # Parallel processing with job control
-    local running=0
-    local -a pids=()
-    local -a pid_ids=()
+  # Run the appropriate worker function
+  run_workers() {
+    local worker_fn="$1"
+    shift
+    if (( PARALLEL <= 1 )); then
+      for i in "${!pending_ids[@]}"; do
+        "$worker_fn" "${pending_ids[$i]}" "${pending_urls[$i]}" "${pending_sources[$i]}" "${pending_notes[$i]}"
+      done
+    else
+      local running=0
+      local -a pids=()
+      local -a pid_ids=()
 
-    for i in "${!pending_ids[@]}"; do
-      # Wait if we're at parallel limit
-      while (( running >= PARALLEL )); do
-        # Wait for any child to finish
-        for j in "${!pids[@]}"; do
-          if ! kill -0 "${pids[$j]}" 2>/dev/null; then
-            wait "${pids[$j]}" 2>/dev/null || true
-            unset 'pids[j]'
-            unset 'pid_ids[j]'
-            running=$((running - 1))
-          fi
+      for i in "${!pending_ids[@]}"; do
+        while (( running >= PARALLEL )); do
+          for j in "${!pids[@]}"; do
+            if ! kill -0 "${pids[$j]}" 2>/dev/null; then
+              wait "${pids[$j]}" 2>/dev/null || true
+              unset 'pids[j]'
+              unset 'pid_ids[j]'
+              running=$((running - 1))
+            fi
+          done
+          pids=("${pids[@]}")
+          pid_ids=("${pid_ids[@]}")
+          sleep 1
         done
-        # Compact arrays
-        pids=("${pids[@]}")
-        pid_ids=("${pid_ids[@]}")
-        sleep 1
+
+        "$worker_fn" "${pending_ids[$i]}" "${pending_urls[$i]}" "${pending_sources[$i]}" "${pending_notes[$i]}" &
+        pids+=($!)
+        pid_ids+=("${pending_ids[$i]}")
+        running=$((running + 1))
       done
 
-      # Launch worker in background
-      process_offer "${pending_ids[$i]}" "${pending_urls[$i]}" "${pending_sources[$i]}" "${pending_notes[$i]}" &
-      pids+=($!)
-      pid_ids+=("${pending_ids[$i]}")
-      running=$((running + 1))
-    done
+      for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+      done
+    fi
+  }
 
-    # Wait for remaining workers
-    for pid in "${pids[@]}"; do
-      wait "$pid" 2>/dev/null || true
-    done
+  if [[ "$MODE" == "triage" ]]; then
+    run_workers process_triage
+    echo ""
+    echo "=== Triage Summary ==="
+    local t_pass=0 t_fail=0 t_score_sum=0 t_score_count=0
+    while IFS=$'\t' read -r sid _ sstatus _ _ _ sscore _ _; do
+      [[ "$sid" == "id" ]] && continue
+      case "$sstatus" in
+        triage_pass)
+          t_pass=$((t_pass + 1))
+          if [[ "$sscore" != "-" && -n "$sscore" ]]; then
+            t_score_sum=$(echo "$t_score_sum + $sscore" | bc 2>/dev/null || echo "$t_score_sum")
+            t_score_count=$((t_score_count + 1))
+          fi
+          ;;
+        triage_fail) t_fail=$((t_fail + 1)) ;;
+      esac
+    done < "$STATE_FILE"
+    echo "Passed: $t_pass | Failed: $t_fail"
+    if (( t_score_count > 0 )); then
+      local avg
+      avg=$(echo "scale=1; $t_score_sum / $t_score_count" | bc 2>/dev/null || echo "N/A")
+      echo "Average triage score: $avg/5"
+    fi
+    echo ""
+    echo "→ Run ./batch-runner.sh --full to evaluate the $t_pass passed offers."
+  else
+    run_workers process_offer
+    merge_tracker
+    print_summary
   fi
-
-  # Merge tracker additions
-  merge_tracker
-
-  # Print summary
-  print_summary
 }
 
 main "$@"
