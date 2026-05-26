@@ -317,7 +317,7 @@ async function pollAndProcess(batchId) {
   let failed    = 0;
   const failIds = [];
 
-  for await (const result of client.messages.batches.results(batchId)) {
+  for await (const result of await client.messages.batches.results(batchId)) {
     const id  = result.custom_id;
     const row = rows.get(id);
     const reportNum  = row?.[5] ?? '???';
