@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -518,6 +519,9 @@ func matchesSearch(app model.CareerApplication, query string) bool {
 		return true
 	}
 	q := strings.ToLower(query)
+	if strings.Contains(strconv.Itoa(app.Number), q) {
+		return true
+	}
 	if strings.Contains(strings.ToLower(app.Company), q) {
 		return true
 	}
