@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch",
+      "WebSearch",
+      "Edit(data/pipeline.md)",
+      "Edit(data/scan-history.tsv)",
+      "Edit(data/applications.md)",
+      "Edit(data/follow-ups.md)",
+      "Write(data/pipeline.md)",
+      "Write(data/scan-history.tsv)",
+      "Bash(node scan.mjs)",
+      "Bash(node merge-tracker.mjs)",
+      "Bash(node verify-pipeline.mjs)",
+      "Bash(node update-system.mjs *)",
+      "Bash(node cv-sync-check.mjs)"
+    ]
+  }
+}
